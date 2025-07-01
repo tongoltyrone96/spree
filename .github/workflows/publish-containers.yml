@@ -1,0 +1,109 @@
+name: Publish
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Optional ref name for custom build
+        required: false
+        type: string
+      prefix:
+        description: Optional image prefix for branch build
+        required: false
+        type: string
+      version:
+        description: Optional custom image version tag
+        required: false
+        type: string
+    secrets:
+      SLACK_WEBHOOK_URL:
+      SLACK_MENTION_GROUP_ID:
+    outputs:
+      version:
+        description: Docker image version
+        value: ${{ jobs.prepare-variables.outputs.version }}
+
+jobs:
+  prepare-variables:
+    name: Prepare variables
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      image_name: ${{ steps.get-image-name.outputs.image_name }}
+      labels: ${{ steps.metadata.outputs.labels }}
+      tags: ${{ steps.metadata.outputs.tags }}
+      version: ${{ steps.metadata.outputs.version }}
+    steps:
+      - name: Get GHCR image name (owner/repo)
+        id: get-image-name
+        env:
+          GH_REPO: ${{ github.repository }}
+        run: |
+          # github.repository is already in owner/repo format required
+          # by GHCR; normalize it to lowercase.
+          GHCR_IMAGE_NAME="${GH_REPO,,}"
+          echo "image_name=$GHCR_IMAGE_NAME" >> $GITHUB_OUTPUT
+
+      # Required by docker/metadata-action
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Docker metadata
+        id: metadata
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ghcr.io/${{ steps.get-image-name.outputs.image_name }}
+          tags: |
+            type=ref,event=branch,prefix=${{ inputs.prefix }}
+            type=pep440,pattern={{version}}
+            type=pep440,pattern={{major}}.{{minor}}
+            type=raw,value=${{ inputs.version }},enable=${{ inputs.version != null }}
+          context: git
+
+
+  build-push:
+    needs: prepare-variables
+    uses: saleor/saleor-internal-actions/.github/workflows/build-push-image-multi-platform.yaml@92c29aa0e4545de579b892b2ef9f2d6366c29c11 # v1.5.2
+    permissions:
+      contents: read
+      id-token: write # needed for AWS/ECR login (not used, but required permission)
+      packages: write # needed for GHCR
+    with:
+      checkout-ref: ${{ inputs.ref }}
+
+      enable-ghcr: true
+      oci-full-repository: ghcr.io/${{ needs.prepare-variables.outputs.image_name }}
+      tags: ${{ needs.prepare-variables.outputs.tags }}
+      labels: ${{ needs.prepare-variables.outputs.labels }}
+
+      amd64-runner-image: ubuntu-24.04
+      arm64-runner-image: ubuntu-24.04-arm
+
+  notify:
+    if: ${{ failure() }}
+    needs: [prepare-variables, build-push]
+    runs-on: ubuntu-24.04
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+          sparse-checkout: |
+            ./.github/workflows/notify
+
+      - name: Notify Slack
+        env:
+          JOB_STATUS: ${{ job.status }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_MENTION_GROUP_ID: ${{ secrets.SLACK_MENTION_GROUP_ID }}
+          JOB_TITLE: "Build of Saleor Core ${{ needs.prepare-variables.outputs.version }}"
+        run: |
+          python3 ./.github/workflows/notify/notify-slack.py
